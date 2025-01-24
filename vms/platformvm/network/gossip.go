@@ -10,13 +10,17 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
+	"go.uber.org/zap"
 
 	"github.com/ava-labs/avalanchego/ids"
 	"github.com/ava-labs/avalanchego/network/p2p"
 	"github.com/ava-labs/avalanchego/network/p2p/gossip"
+	"github.com/ava-labs/avalanchego/snow/engine/common"
 	"github.com/ava-labs/avalanchego/utils/logging"
 	"github.com/ava-labs/avalanchego/vms/platformvm/txs"
-	"github.com/ava-labs/avalanchego/vms/platformvm/txs/mempool"
+	"github.com/ava-labs/avalanchego/vms/txs/mempool"
+
+	pmempool "github.com/ava-labs/avalanchego/vms/platformvm/txs/mempool"
 )
 
 var (
@@ -49,7 +53,7 @@ func (t txGossipHandler) AppRequest(
 	nodeID ids.NodeID,
 	deadline time.Time,
 	requestBytes []byte,
-) ([]byte, error) {
+) ([]byte, *common.AppError) {
 	return t.appRequestHandler.AppRequest(ctx, nodeID, deadline, requestBytes)
 }
 
@@ -64,7 +68,7 @@ func (txMarshaller) UnmarshalGossip(bytes []byte) (*txs.Tx, error) {
 }
 
 func newGossipMempool(
-	mempool mempool.Mempool,
+	mempool pmempool.Mempool,
 	registerer prometheus.Registerer,
 	log logging.Logger,
 	txVerifier TxVerifier,
@@ -82,7 +86,7 @@ func newGossipMempool(
 }
 
 type gossipMempool struct {
-	mempool.Mempool
+	pmempool.Mempool
 	log        logging.Logger
 	txVerifier TxVerifier
 
@@ -105,8 +109,13 @@ func (g *gossipMempool) Add(tx *txs.Tx) error {
 	}
 
 	if err := g.txVerifier.VerifyTx(tx); err != nil {
+		g.log.Debug("transaction failed verification",
+			zap.Stringer("txID", txID),
+			zap.Error(err),
+		)
+
 		g.Mempool.MarkDropped(txID, err)
-		return err
+		return fmt.Errorf("failed verification: %w", err)
 	}
 
 	if err := g.Mempool.Add(tx); err != nil {

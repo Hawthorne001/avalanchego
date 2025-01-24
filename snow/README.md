@@ -39,7 +39,7 @@ All messaging functions in `OutboundMsgBuilder` can be categorized as follows:
 - **Bootstrapping**
   - Nodes can ask other nodes for blocks to build their own copy of the chain. A node can fetch all blocks from the locally last accepted block to the current last accepted block in the network.
 - **Consensus**
-  - Once a node is up to tip they can participate in consensus! During consensus, a node conducts a poll to several different small random samples of the validator set. They can communicate decisons on whether or not they have accepted/rejected a block.
+  - Once a node is up to tip they can participate in consensus! During consensus, a node conducts a poll to several different small random samples of the validator set. They can communicate decisions on whether or not they have accepted/rejected a block.
 - **App**
   - VMs communicate application-specific messages to other nodes through app messages. A common example is mempool gossiping.
 
@@ -47,7 +47,7 @@ Currently, Avalanchego implements its own message serialization to communicate. 
 
 ### [Network](https://github.com/ava-labs/avalanchego/blob/master/network/network.go)
 
-The networking interface is shared across all chains. It implements functions from the `ExternalSender` interface. The two functions it implements are `Send` and `Gossip`. `Send` sends a message of type `OutboundMessage` to a specific set of nodes (specified by an array of `NodeIDs`). `Gossip` sends a message of type `OutboundMessage` to a random group of nodes in a subnet (can be a validator or a non-validator). Gossipping is used to push transactions across the network. The networking protocol uses TLS to pass messages between peers.
+The networking interface is shared across all chains. It implements functions from the `ExternalSender` interface. The two functions it implements are `Send` and `Gossip`. `Send` sends a message of type `OutboundMessage` to a specific set of nodes (specified by an array of `NodeIDs`). `Gossip` sends a message of type `OutboundMessage` to a random group of nodes in a subnet (can be a validator or a non-validator). Gossiping is used to push transactions across the network. The networking protocol uses TLS to pass messages between peers.
 
 Along with sending and gossiping, the networking library is also responsible for making connections and maintaining connections. Any node whether they are a validator or non-validator will attempt to connect to the primary network.
 
