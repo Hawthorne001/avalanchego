@@ -16,13 +16,18 @@ import (
 	"github.com/ava-labs/avalanchego/cache"
 	"github.com/ava-labs/avalanchego/ids"
 	"github.com/ava-labs/avalanchego/network/p2p"
-	"github.com/ava-labs/avalanchego/utils"
+	"github.com/ava-labs/avalanchego/snow/engine/common"
 	"github.com/ava-labs/avalanchego/utils/bloom"
 	"github.com/ava-labs/avalanchego/utils/buffer"
 	"github.com/ava-labs/avalanchego/utils/logging"
+	"github.com/ava-labs/avalanchego/utils/set"
 )
 
 const (
+	ioLabel    = "io"
+	sentIO     = "sent"
+	receivedIO = "received"
+
 	typeLabel  = "type"
 	pushType   = "push"
 	pullType   = "pull"
@@ -37,16 +42,26 @@ var (
 	_ Gossiper = (*PullGossiper[*testTx])(nil)
 	_ Gossiper = (*NoOpGossiper)(nil)
 
-	_ Set[*testTx] = (*EmptySet[*testTx])(nil)
 	_ Set[*testTx] = (*FullSet[*testTx])(nil)
 
-	metricLabels = []string{typeLabel}
-	pushLabels   = prometheus.Labels{
+	ioTypeLabels   = []string{ioLabel, typeLabel}
+	sentPushLabels = prometheus.Labels{
+		ioLabel:   sentIO,
 		typeLabel: pushType,
 	}
-	pullLabels = prometheus.Labels{
+	receivedPushLabels = prometheus.Labels{
+		ioLabel:   receivedIO,
+		typeLabel: pushType,
+	}
+	sentPullLabels = prometheus.Labels{
+		ioLabel:   sentIO,
 		typeLabel: pullType,
 	}
+	receivedPullLabels = prometheus.Labels{
+		ioLabel:   receivedIO,
+		typeLabel: pullType,
+	}
+	typeLabels   = []string{typeLabel}
 	unsentLabels = prometheus.Labels{
 		typeLabel: unsentType,
 	}
@@ -61,8 +76,6 @@ var (
 	ErrInvalidDiscardedSize     = errors.New("discarded size cannot be negative")
 	ErrInvalidTargetGossipSize  = errors.New("target gossip size cannot be negative")
 	ErrInvalidRegossipFrequency = errors.New("re-gossip frequency cannot be negative")
-
-	errEmptySetCantAdd = errors.New("empty set can not add")
 )
 
 // Gossiper gossips Gossipables to other nodes
@@ -82,12 +95,11 @@ type ValidatorGossiper struct {
 // Metrics that are tracked across a gossip protocol. A given protocol should
 // only use a single instance of Metrics.
 type Metrics struct {
-	sentCount               *prometheus.CounterVec
-	sentBytes               *prometheus.CounterVec
-	receivedCount           *prometheus.CounterVec
-	receivedBytes           *prometheus.CounterVec
+	count                   *prometheus.CounterVec
+	bytes                   *prometheus.CounterVec
 	tracking                *prometheus.GaugeVec
 	trackingLifetimeAverage prometheus.Gauge
+	topValidators           *prometheus.GaugeVec
 }
 
 // NewMetrics returns a common set of metrics
@@ -96,46 +108,68 @@ func NewMetrics(
 	namespace string,
 ) (Metrics, error) {
 	m := Metrics{
-		sentCount: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Namespace: namespace,
-			Name:      "gossip_sent_count",
-			Help:      "amount of gossip sent (n)",
-		}, metricLabels),
-		sentBytes: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Namespace: namespace,
-			Name:      "gossip_sent_bytes",
-			Help:      "amount of gossip sent (bytes)",
-		}, metricLabels),
-		receivedCount: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Namespace: namespace,
-			Name:      "gossip_received_count",
-			Help:      "amount of gossip received (n)",
-		}, metricLabels),
-		receivedBytes: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Namespace: namespace,
-			Name:      "gossip_received_bytes",
-			Help:      "amount of gossip received (bytes)",
-		}, metricLabels),
-		tracking: prometheus.NewGaugeVec(prometheus.GaugeOpts{
-			Namespace: namespace,
-			Name:      "gossip_tracking",
-			Help:      "number of gossipables being tracked",
-		}, metricLabels),
+		count: prometheus.NewCounterVec(
+			prometheus.CounterOpts{
+				Namespace: namespace,
+				Name:      "gossip_count",
+				Help:      "amount of gossip (n)",
+			},
+			ioTypeLabels,
+		),
+		bytes: prometheus.NewCounterVec(
+			prometheus.CounterOpts{
+				Namespace: namespace,
+				Name:      "gossip_bytes",
+				Help:      "amount of gossip (bytes)",
+			},
+			ioTypeLabels,
+		),
+		tracking: prometheus.NewGaugeVec(
+			prometheus.GaugeOpts{
+				Namespace: namespace,
+				Name:      "gossip_tracking",
+				Help:      "number of gossipables being tracked",
+			},
+			typeLabels,
+		),
 		trackingLifetimeAverage: prometheus.NewGauge(prometheus.GaugeOpts{
 			Namespace: namespace,
 			Name:      "gossip_tracking_lifetime_average",
 			Help:      "average duration a gossipable has been tracked (ns)",
 		}),
+		topValidators: prometheus.NewGaugeVec(
+			prometheus.GaugeOpts{
+				Namespace: namespace,
+				Name:      "top_validators",
+				Help:      "number of validators gossipables are sent to due to stake",
+			},
+			typeLabels,
+		),
 	}
-	err := utils.Err(
-		metrics.Register(m.sentCount),
-		metrics.Register(m.sentBytes),
-		metrics.Register(m.receivedCount),
-		metrics.Register(m.receivedBytes),
+	err := errors.Join(
+		metrics.Register(m.count),
+		metrics.Register(m.bytes),
 		metrics.Register(m.tracking),
 		metrics.Register(m.trackingLifetimeAverage),
+		metrics.Register(m.topValidators),
 	)
 	return m, err
+}
+
+func (m *Metrics) observeMessage(labels prometheus.Labels, count int, bytes int) error {
+	countMetric, err := m.count.GetMetricWith(labels)
+	if err != nil {
+		return fmt.Errorf("failed to get count metric: %w", err)
+	}
+
+	bytesMetric, err := m.bytes.GetMetricWith(labels)
+	if err != nil {
+		return fmt.Errorf("failed to get bytes metric: %w", err)
+	}
+
+	countMetric.Add(float64(count))
+	bytesMetric.Add(float64(bytes))
+	return nil
 }
 
 func (v ValidatorGossiper) Gossip(ctx context.Context) error {
@@ -241,26 +275,18 @@ func (p *PullGossiper[_]) handleResponse(
 		}
 	}
 
-	receivedCountMetric, err := p.metrics.receivedCount.GetMetricWith(pullLabels)
-	if err != nil {
-		p.log.Error("failed to get received count metric", zap.Error(err))
-		return
+	if err := p.metrics.observeMessage(receivedPullLabels, len(gossip), receivedBytes); err != nil {
+		p.log.Error("failed to update metrics",
+			zap.Error(err),
+		)
 	}
-
-	receivedBytesMetric, err := p.metrics.receivedBytes.GetMetricWith(pullLabels)
-	if err != nil {
-		p.log.Error("failed to get received bytes metric", zap.Error(err))
-		return
-	}
-
-	receivedCountMetric.Add(float64(len(gossip)))
-	receivedBytesMetric.Add(float64(receivedBytes))
 }
 
 // NewPushGossiper returns an instance of PushGossiper
 func NewPushGossiper[T Gossipable](
 	marshaller Marshaller[T],
 	mempool Set[T],
+	validators p2p.ValidatorSubset,
 	client *p2p.Client,
 	metrics Metrics,
 	gossipParams BranchingFactor,
@@ -287,6 +313,7 @@ func NewPushGossiper[T Gossipable](
 	return &PushGossiper[T]{
 		marshaller:           marshaller,
 		set:                  mempool,
+		validators:           validators,
 		client:               client,
 		metrics:              metrics,
 		gossipParams:         gossipParams,
@@ -305,6 +332,7 @@ func NewPushGossiper[T Gossipable](
 type PushGossiper[T Gossipable] struct {
 	marshaller Marshaller[T]
 	set        Set[T]
+	validators p2p.ValidatorSubset
 	client     *p2p.Client
 	metrics    Metrics
 
@@ -322,9 +350,20 @@ type PushGossiper[T Gossipable] struct {
 }
 
 type BranchingFactor struct {
-	Validators    int
+	// StakePercentage determines the percentage of stake that should have
+	// gossip sent to based on the inverse CDF of stake weights. This value does
+	// not account for the connectivity of the nodes.
+	StakePercentage float64
+	// Validators specifies the number of connected validators, in addition to
+	// any validators sent from the StakePercentage parameter, to send gossip
+	// to. These validators are sampled uniformly rather than by stake.
+	Validators int
+	// NonValidators specifies the number of connected non-validators to send
+	// gossip to.
 	NonValidators int
-	Peers         int
+	// Peers specifies the number of connected validators or non-validators, in
+	// addition to the number sent due to other configs, to send gossip to.
+	Peers int
 }
 
 func (b *BranchingFactor) Verify() error {
@@ -371,6 +410,7 @@ func (p *PushGossiper[T]) Gossip(ctx context.Context) error {
 		p.toGossip,
 		p.toRegossip,
 		&cache.Empty[ids.ID, struct{}]{}, // Don't mark dropped unsent transactions as discarded
+		unsentLabels,
 	); err != nil {
 		return fmt.Errorf("unexpected error during gossip: %w", err)
 	}
@@ -382,6 +422,7 @@ func (p *PushGossiper[T]) Gossip(ctx context.Context) error {
 		p.toRegossip,
 		p.toRegossip,
 		p.discarded, // Mark dropped sent transactions as discarded
+		sentLabels,
 	); err != nil {
 		return fmt.Errorf("unexpected error during regossip: %w", err)
 	}
@@ -395,6 +436,7 @@ func (p *PushGossiper[T]) gossip(
 	toGossip buffer.Deque[T],
 	toRegossip buffer.Deque[T],
 	discarded cache.Cacher[ids.ID, struct{}],
+	metricsLabels prometheus.Labels,
 ) error {
 	var (
 		sentBytes                   = 0
@@ -449,23 +491,28 @@ func (p *PushGossiper[T]) gossip(
 	if err != nil {
 		return err
 	}
-	sentCountMetric, err := p.metrics.sentCount.GetMetricWith(pushLabels)
-	if err != nil {
-		return fmt.Errorf("failed to get sent count metric: %w", err)
+
+	if err := p.metrics.observeMessage(sentPushLabels, len(gossip), sentBytes); err != nil {
+		return err
 	}
-	sentBytesMetric, err := p.metrics.sentBytes.GetMetricWith(pushLabels)
+
+	topValidatorsMetric, err := p.metrics.topValidators.GetMetricWith(metricsLabels)
 	if err != nil {
-		return fmt.Errorf("failed to get sent bytes metric: %w", err)
+		return fmt.Errorf("failed to get top validators metric: %w", err)
 	}
-	sentCountMetric.Add(float64(len(gossip)))
-	sentBytesMetric.Add(float64(sentBytes))
+
+	validatorsByStake := p.validators.Top(ctx, gossipParams.StakePercentage)
+	topValidatorsMetric.Set(float64(len(validatorsByStake)))
 
 	return p.client.AppGossip(
 		ctx,
+		common.SendConfig{
+			NodeIDs:       set.Of(validatorsByStake...),
+			Validators:    gossipParams.Validators,
+			NonValidators: gossipParams.NonValidators,
+			Peers:         gossipParams.Peers,
+		},
 		msgBytes,
-		gossipParams.Validators,
-		gossipParams.NonValidators,
-		gossipParams.Peers,
 	)
 }
 
@@ -551,26 +598,6 @@ type TestGossiper struct {
 
 func (t *TestGossiper) Gossip(ctx context.Context) error {
 	return t.GossipF(ctx)
-}
-
-type EmptySet[T Gossipable] struct{}
-
-func (EmptySet[_]) Gossip(context.Context) error {
-	return nil
-}
-
-func (EmptySet[T]) Add(T) error {
-	return errEmptySetCantAdd
-}
-
-func (EmptySet[T]) Has(ids.ID) bool {
-	return false
-}
-
-func (EmptySet[T]) Iterate(func(gossipable T) bool) {}
-
-func (EmptySet[_]) GetFilter() ([]byte, []byte) {
-	return bloom.EmptyFilter.Marshal(), ids.Empty[:]
 }
 
 type FullSet[T Gossipable] struct{}

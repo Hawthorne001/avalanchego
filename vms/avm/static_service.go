@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"time"
 
 	"github.com/ava-labs/avalanchego/ids"
 	"github.com/ava-labs/avalanchego/utils"
@@ -69,6 +68,18 @@ type AssetDefinition struct {
 	Memo         string                   `json:"memo"`
 }
 
+// Holder describes how much an address owns of an asset
+type Holder struct {
+	Amount  avajson.Uint64 `json:"amount"`
+	Address string         `json:"address"`
+}
+
+// Owners describes who can perform an action
+type Owners struct {
+	Threshold avajson.Uint32 `json:"threshold"`
+	Minters   []string       `json:"minters"`
+}
+
 // BuildGenesisReply is the reply from BuildGenesis
 type BuildGenesisReply struct {
 	Bytes    string              `json:"bytes"`
@@ -79,7 +90,6 @@ type BuildGenesisReply struct {
 // referenced in the UTXO.
 func (*StaticService) BuildGenesis(_ *http.Request, args *BuildGenesisArgs, reply *BuildGenesisReply) error {
 	parser, err := txs.NewParser(
-		time.Time{},
 		[]fxs.Fx{
 			&secp256k1fx.Fx{},
 			&nftfx.Fx{},

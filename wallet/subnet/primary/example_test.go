@@ -27,11 +27,13 @@ func ExampleWallet() {
 	// MakeWallet fetches the available UTXOs owned by [kc] on the network that
 	// [LocalAPIURI] is hosting.
 	walletSyncStartTime := time.Now()
-	wallet, err := MakeWallet(ctx, &WalletConfig{
-		URI:          LocalAPIURI,
-		AVAXKeychain: kc,
-		EthKeychain:  kc,
-	})
+	wallet, err := MakeWallet(
+		ctx,
+		LocalAPIURI,
+		kc,
+		kc,
+		WalletConfig{},
+	)
 	if err != nil {
 		log.Fatalf("failed to initialize wallet with: %s\n", err)
 		return
@@ -41,9 +43,11 @@ func ExampleWallet() {
 	// Get the P-chain and the X-chain wallets
 	pWallet := wallet.P()
 	xWallet := wallet.X()
+	xBuilder := xWallet.Builder()
+	xContext := xBuilder.Context()
 
 	// Pull out useful constants to use when issuing transactions.
-	xChainID := xWallet.BlockchainID()
+	xChainID := xContext.BlockchainID
 	owner := &secp256k1fx.OutputOwners{
 		Threshold: 1,
 		Addrs: []ids.ShortID{

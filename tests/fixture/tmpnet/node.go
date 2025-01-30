@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strings"
@@ -20,7 +21,8 @@ import (
 	"github.com/ava-labs/avalanchego/config"
 	"github.com/ava-labs/avalanchego/ids"
 	"github.com/ava-labs/avalanchego/staking"
-	"github.com/ava-labs/avalanchego/utils/crypto/bls"
+	"github.com/ava-labs/avalanchego/utils/crypto/bls/signer/localsigner"
+	"github.com/ava-labs/avalanchego/utils/logging"
 	"github.com/ava-labs/avalanchego/vms/platformvm/signer"
 )
 
@@ -40,7 +42,7 @@ var (
 // NodeRuntime defines the methods required to support running a node.
 type NodeRuntime interface {
 	readState() error
-	Start(w io.Writer) error
+	Start(log logging.Logger) error
 	InitiateStop() error
 	WaitForStopped(ctx context.Context) error
 	IsHealthy(ctx context.Context) (bool, error)
@@ -53,6 +55,16 @@ type NodeRuntimeConfig struct {
 
 // Node supports configuring and running a node participating in a temporary network.
 type Node struct {
+	// Uniquely identifies the network the node is part of to enable monitoring.
+	NetworkUUID string
+
+	// Identify the entity associated with this network. This is
+	// intended to be used to label metrics to enable filtering
+	// results for a test run between the primary/shared network used
+	// by the majority of tests and private networks used by
+	// individual tests.
+	NetworkOwner string
+
 	// Set by EnsureNodeID which is also called when the node is read.
 	NodeID ids.NodeID
 
@@ -68,7 +80,7 @@ type Node struct {
 
 	// Runtime state, intended to be set by NodeRuntime
 	URI            string
-	StakingAddress string
+	StakingAddress netip.AddrPort
 
 	// Initialized on demand
 	runtime NodeRuntime
@@ -83,11 +95,24 @@ func NewNode(dataDir string) *Node {
 	}
 }
 
+// Initializes an ephemeral node using the provided config flags
+func NewEphemeralNode(flags FlagsMap) *Node {
+	node := NewNode("")
+	node.Flags = flags
+	node.IsEphemeral = true
+
+	return node
+}
+
 // Initializes the specified number of nodes.
-func NewNodes(count int) []*Node {
+func NewNodesOrPanic(count int) []*Node {
 	nodes := make([]*Node, count)
 	for i := range nodes {
-		nodes[i] = NewNode("")
+		node := NewNode("")
+		if err := node.EnsureKeys(); err != nil {
+			panic(err)
+		}
+		nodes[i] = node
 	}
 	return nodes
 }
@@ -147,8 +172,8 @@ func (n *Node) IsHealthy(ctx context.Context) (bool, error) {
 	return n.getRuntime().IsHealthy(ctx)
 }
 
-func (n *Node) Start(w io.Writer) error {
-	return n.getRuntime().Start(w)
+func (n *Node) Start(log logging.Logger) error {
+	return n.getRuntime().Start(log)
 }
 
 func (n *Node) InitiateStop(ctx context.Context) error {
@@ -166,7 +191,7 @@ func (n *Node) readState() error {
 	return n.getRuntime().readState()
 }
 
-func (n *Node) getDataDir() string {
+func (n *Node) GetDataDir() string {
 	return cast.ToString(n.Flags[config.DataDirKey])
 }
 
@@ -204,13 +229,14 @@ func (n *Node) Stop(ctx context.Context) error {
 // Sets networking configuration for the node.
 // Convenience method for setting networking flags.
 func (n *Node) SetNetworkingConfig(bootstrapIDs []string, bootstrapIPs []string) {
-	var (
-		// Use dynamic port allocation.
-		httpPort    uint16 = 0
-		stakingPort uint16 = 0
-	)
-	n.Flags[config.HTTPPortKey] = httpPort
-	n.Flags[config.StakingPortKey] = stakingPort
+	if _, ok := n.Flags[config.HTTPPortKey]; !ok {
+		// Default to dynamic port allocation
+		n.Flags[config.HTTPPortKey] = 0
+	}
+	if _, ok := n.Flags[config.StakingPortKey]; !ok {
+		// Default to dynamic port allocation
+		n.Flags[config.StakingPortKey] = 0
+	}
 	n.Flags[config.BootstrapIDsKey] = strings.Join(bootstrapIDs, ",")
 	n.Flags[config.BootstrapIPsKey] = strings.Join(bootstrapIPs, ",")
 }
@@ -240,11 +266,11 @@ func (n *Node) EnsureBLSSigningKey() error {
 	}
 
 	// Generate a new signing key
-	newKey, err := bls.NewSecretKey()
+	newKey, err := localsigner.New()
 	if err != nil {
 		return fmt.Errorf("failed to generate staking signer key: %w", err)
 	}
-	n.Flags[config.StakingSignerKeyContentKey] = base64.StdEncoding.EncodeToString(bls.SerializeSecretKey(newKey))
+	n.Flags[config.StakingSignerKeyContentKey] = base64.StdEncoding.EncodeToString(newKey.ToBytes())
 	return nil
 }
 
@@ -290,7 +316,7 @@ func (n *Node) GetProofOfPossession() (*signer.ProofOfPossession, error) {
 	if err != nil {
 		return nil, err
 	}
-	secretKey, err := bls.SecretKeyFromBytes(signingKeyBytes)
+	secretKey, err := localsigner.FromBytes(signingKeyBytes)
 	if err != nil {
 		return nil, err
 	}
@@ -330,8 +356,19 @@ func (n *Node) EnsureNodeID() error {
 	if err != nil {
 		return fmt.Errorf("failed to ensure node ID: failed to load tls cert: %w", err)
 	}
-	stakingCert := staking.CertificateFromX509(tlsCert.Leaf)
+	stakingCert, err := staking.ParseCertificate(tlsCert.Leaf.Raw)
+	if err != nil {
+		return fmt.Errorf("failed to ensure node ID: failed to parse staking cert: %w", err)
+	}
 	n.NodeID = ids.NodeIDFromCert(stakingCert)
 
 	return nil
+}
+
+// GetUniqueID returns a globally unique identifier for the node.
+func (n *Node) GetUniqueID() string {
+	nodeIDString := n.NodeID.String()
+	startIndex := len(ids.NodeIDPrefix)
+	endIndex := startIndex + 8 // 8 characters should be enough to identify a node in the context of its network
+	return n.NetworkUUID + "-" + strings.ToLower(nodeIDString[startIndex:endIndex])
 }

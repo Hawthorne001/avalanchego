@@ -5,7 +5,7 @@ package network
 
 import (
 	"context"
-	"errors"
+	"sync"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -13,24 +13,22 @@ import (
 
 	"github.com/ava-labs/avalanchego/ids"
 	"github.com/ava-labs/avalanchego/network/p2p"
+	"github.com/ava-labs/avalanchego/network/p2p/acp118"
 	"github.com/ava-labs/avalanchego/network/p2p/gossip"
 	"github.com/ava-labs/avalanchego/snow/engine/common"
 	"github.com/ava-labs/avalanchego/snow/validators"
 	"github.com/ava-labs/avalanchego/utils/logging"
-	"github.com/ava-labs/avalanchego/vms/components/message"
+	"github.com/ava-labs/avalanchego/vms/platformvm/config"
+	"github.com/ava-labs/avalanchego/vms/platformvm/state"
 	"github.com/ava-labs/avalanchego/vms/platformvm/txs"
 	"github.com/ava-labs/avalanchego/vms/platformvm/txs/mempool"
+	"github.com/ava-labs/avalanchego/vms/platformvm/warp"
 )
-
-const TxGossipHandlerID = 0
-
-var errMempoolDisabledWithPartialSync = errors.New("mempool is disabled partial syncing")
 
 type Network struct {
 	*p2p.Network
 
 	log                       logging.Logger
-	txVerifier                TxVerifier
 	mempool                   *gossipMempool
 	partialSyncPrimaryNetwork bool
 	appSender                 common.AppSender
@@ -50,8 +48,11 @@ func New(
 	mempool mempool.Mempool,
 	partialSyncPrimaryNetwork bool,
 	appSender common.AppSender,
+	stateLock sync.Locker,
+	state state.Chain,
+	signer warp.Signer,
 	registerer prometheus.Registerer,
-	config Config,
+	config config.Network,
 ) (*Network, error) {
 	p2pNetwork, err := p2p.NewNetwork(log, appSender, registerer, "p2p")
 	if err != nil {
@@ -67,7 +68,7 @@ func New(
 		config.MaxValidatorSetStaleness,
 	)
 	txGossipClient := p2pNetwork.NewClient(
-		TxGossipHandlerID,
+		p2p.TxGossipHandlerID,
 		p2p.WithValidatorSampling(validators),
 	)
 	txGossipMetrics, err := gossip.NewMetrics(registerer, "tx")
@@ -91,11 +92,13 @@ func New(
 	txPushGossiper, err := gossip.NewPushGossiper[*txs.Tx](
 		marshaller,
 		gossipMempool,
+		validators,
 		txGossipClient,
 		txGossipMetrics,
 		gossip.BranchingFactor{
-			Validators: config.PushGossipNumValidators,
-			Peers:      config.PushGossipNumPeers,
+			StakePercentage: config.PushGossipPercentStake,
+			Validators:      config.PushGossipNumValidators,
+			Peers:           config.PushGossipNumPeers,
 		},
 		gossip.BranchingFactor{
 			Validators: config.PushRegossipNumValidators,
@@ -153,14 +156,24 @@ func New(
 		appRequestHandler: validatorHandler,
 	}
 
-	if err := p2pNetwork.AddHandler(TxGossipHandlerID, txGossipHandler); err != nil {
+	if err := p2pNetwork.AddHandler(p2p.TxGossipHandlerID, txGossipHandler); err != nil {
+		return nil, err
+	}
+
+	// We allow all peers to request warp messaging signatures
+	signatureRequestVerifier := signatureRequestVerifier{
+		stateLock: stateLock,
+		state:     state,
+	}
+	signatureRequestHandler := acp118.NewHandler(signatureRequestVerifier, signer)
+
+	if err := p2pNetwork.AddHandler(acp118.HandlerID, signatureRequestHandler); err != nil {
 		return nil, err
 	}
 
 	return &Network{
 		Network:                   p2pNetwork,
 		log:                       log,
-		txVerifier:                txVerifier,
 		mempool:                   gossipMempool,
 		partialSyncPrimaryNetwork: partialSyncPrimaryNetwork,
 		appSender:                 appSender,
@@ -172,18 +185,12 @@ func New(
 }
 
 func (n *Network) PushGossip(ctx context.Context) {
-	// TODO: Even though the node is running partial sync, we should support
-	// issuing transactions from the RPC.
-	if n.partialSyncPrimaryNetwork {
-		return
-	}
-
 	gossip.Every(ctx, n.log, n.txPushGossiper, n.txPushGossipFrequency)
 }
 
 func (n *Network) PullGossip(ctx context.Context) {
-	// If the node is running partial sync, we should not perform any pull
-	// gossip.
+	// If the node is running partial sync, we do not perform any pull gossip
+	// because we should never be a validator.
 	if n.partialSyncPrimaryNetwork {
 		return
 	}
@@ -192,11 +199,6 @@ func (n *Network) PullGossip(ctx context.Context) {
 }
 
 func (n *Network) AppGossip(ctx context.Context, nodeID ids.NodeID, msgBytes []byte) error {
-	n.log.Debug("called AppGossip message handler",
-		zap.Stringer("nodeID", nodeID),
-		zap.Int("messageLen", len(msgBytes)),
-	)
-
 	if n.partialSyncPrimaryNetwork {
 		n.log.Debug("dropping AppGossip message",
 			zap.String("reason", "primary network is not being fully synced"),
@@ -204,63 +206,13 @@ func (n *Network) AppGossip(ctx context.Context, nodeID ids.NodeID, msgBytes []b
 		return nil
 	}
 
-	msgIntf, err := message.Parse(msgBytes)
-	if err != nil {
-		n.log.Debug("forwarding AppGossip to p2p network",
-			zap.String("reason", "failed to parse message"),
-		)
-
-		return n.Network.AppGossip(ctx, nodeID, msgBytes)
-	}
-
-	msg, ok := msgIntf.(*message.Tx)
-	if !ok {
-		n.log.Debug("dropping unexpected message",
-			zap.Stringer("nodeID", nodeID),
-		)
-		return nil
-	}
-
-	tx, err := txs.Parse(txs.Codec, msg.Tx)
-	if err != nil {
-		n.log.Verbo("received invalid tx",
-			zap.Stringer("nodeID", nodeID),
-			zap.Binary("tx", msg.Tx),
-			zap.Error(err),
-		)
-		return nil
-	}
-
-	// Returning an error here would result in shutting down the chain. Logging
-	// is already included inside addTxToMempool, so there's nothing to do with
-	// the returned error here.
-	_ = n.addTxToMempool(tx)
-	return nil
+	return n.Network.AppGossip(ctx, nodeID, msgBytes)
 }
 
 func (n *Network) IssueTxFromRPC(tx *txs.Tx) error {
-	// TODO: We should still push the transaction to some peers when partial
-	// syncing.
-	if err := n.addTxToMempool(tx); err != nil {
+	if err := n.mempool.Add(tx); err != nil {
 		return err
 	}
 	n.txPushGossiper.Add(tx)
 	return nil
-}
-
-func (n *Network) addTxToMempool(tx *txs.Tx) error {
-	// If we are partially syncing the Primary Network, we should not be
-	// maintaining the transaction mempool locally.
-	if n.partialSyncPrimaryNetwork {
-		return errMempoolDisabledWithPartialSync
-	}
-
-	err := n.mempool.Add(tx)
-	if err != nil {
-		n.log.Debug("tx failed to be added to the mempool",
-			zap.Stringer("txID", tx.ID()),
-			zap.Error(err),
-		)
-	}
-	return err
 }

@@ -4,83 +4,32 @@
 package avm
 
 import (
-	"context"
-	"fmt"
 	"math/rand"
 	"testing"
 
 	"github.com/stretchr/testify/require"
 
 	"github.com/ava-labs/avalanchego/ids"
+	"github.com/ava-labs/avalanchego/upgrade/upgradetest"
 	"github.com/ava-labs/avalanchego/utils/set"
 	"github.com/ava-labs/avalanchego/vms/components/avax"
-	"github.com/ava-labs/avalanchego/vms/components/keystore"
 	"github.com/ava-labs/avalanchego/vms/secp256k1fx"
 )
 
-func BenchmarkLoadUser(b *testing.B) {
-	runLoadUserBenchmark := func(b *testing.B, numKeys int) {
-		require := require.New(b)
-
-		env := setup(b, &envConfig{
-			keystoreUsers: []*user{{
-				username: username,
-				password: password,
-			}},
-		})
-		defer func() {
-			require.NoError(env.vm.Shutdown(context.Background()))
-			env.vm.ctx.Lock.Unlock()
-		}()
-
-		user, err := keystore.NewUserFromKeystore(env.vm.ctx.Keystore, username, password)
-		require.NoError(err)
-
-		keys, err := keystore.NewKeys(user, numKeys)
-		require.NoError(err)
-
-		b.ResetTimer()
-
-		fromAddrs := set.Set[ids.ShortID]{}
-		for n := 0; n < b.N; n++ {
-			addrIndex := n % numKeys
-			fromAddrs.Clear()
-			fromAddrs.Add(keys[addrIndex].PublicKey().Address())
-			_, _, err := env.vm.LoadUser(username, password, fromAddrs)
-			require.NoError(err)
-		}
-
-		b.StopTimer()
-
-		require.NoError(user.Close())
-	}
-
-	benchmarkSize := []int{10, 100, 1000, 5000}
-	for _, numKeys := range benchmarkSize {
-		b.Run(fmt.Sprintf("NumKeys=%d", numKeys), func(b *testing.B) {
-			runLoadUserBenchmark(b, numKeys)
-		})
-	}
-}
-
-// GetAllUTXOsBenchmark is a helper func to benchmark the GetAllUTXOs depending on the size
-func GetAllUTXOsBenchmark(b *testing.B, utxoCount int) {
+// getAllUTXOsBenchmark is a helper func to benchmark the GetAllUTXOs depending on the size
+func getAllUTXOsBenchmark(b *testing.B, utxoCount int, randSrc rand.Source) {
 	require := require.New(b)
 
-	env := setup(b, &envConfig{})
-	defer func() {
-		require.NoError(env.vm.Shutdown(context.Background()))
-		env.vm.ctx.Lock.Unlock()
-	}()
+	env := setup(b, &envConfig{fork: upgradetest.Latest})
+	defer env.vm.ctx.Lock.Unlock()
 
 	addr := ids.GenerateTestShortID()
 
-	// #nosec G404
 	for i := 0; i < utxoCount; i++ {
 		utxo := &avax.UTXO{
 			UTXOID: avax.UTXOID{
 				TxID:        ids.GenerateTestID(),
-				OutputIndex: rand.Uint32(),
+				OutputIndex: uint32(randSrc.Int63()),
 			},
 			Asset: avax.Asset{ID: env.vm.ctx.AVAXAssetID},
 			Out: &secp256k1fx.TransferOutput{
@@ -128,9 +77,10 @@ func BenchmarkGetUTXOs(b *testing.B) {
 		},
 	}
 
-	for _, count := range tests {
+	for testIdx, count := range tests {
+		randSrc := rand.NewSource(int64(testIdx))
 		b.Run(count.name, func(b *testing.B) {
-			GetAllUTXOsBenchmark(b, count.utxoCount)
+			getAllUTXOsBenchmark(b, count.utxoCount, randSrc)
 		})
 	}
 }

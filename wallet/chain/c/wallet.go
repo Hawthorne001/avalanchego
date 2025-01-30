@@ -4,29 +4,25 @@
 package c
 
 import (
-	"errors"
+	"context"
 	"math/big"
 	"time"
 
 	"github.com/ava-labs/coreth/ethclient"
-	"github.com/ava-labs/coreth/plugin/evm"
+	"github.com/ava-labs/coreth/plugin/evm/atomic"
+	"github.com/ava-labs/coreth/plugin/evm/client"
 
 	"github.com/ava-labs/avalanchego/ids"
+	"github.com/ava-labs/avalanchego/utils/rpc"
 	"github.com/ava-labs/avalanchego/vms/secp256k1fx"
 	"github.com/ava-labs/avalanchego/wallet/subnet/primary/common"
 
 	ethcommon "github.com/ethereum/go-ethereum/common"
 )
 
-var (
-	_ Wallet = (*wallet)(nil)
-
-	errNotCommitted = errors.New("not committed")
-)
+var _ Wallet = (*wallet)(nil)
 
 type Wallet interface {
-	Context
-
 	// Builder returns the builder that will be used to create the transactions.
 	Builder() Builder
 
@@ -42,7 +38,7 @@ type Wallet interface {
 		chainID ids.ID,
 		to ethcommon.Address,
 		options ...common.Option,
-	) (*evm.Tx, error)
+	) (*atomic.Tx, error)
 
 	// IssueExportTx creates, signs, and issues an export transaction that
 	// attempts to send all the provided [outputs] to the requested [chainID].
@@ -53,17 +49,17 @@ type Wallet interface {
 		chainID ids.ID,
 		outputs []*secp256k1fx.TransferOutput,
 		options ...common.Option,
-	) (*evm.Tx, error)
+	) (*atomic.Tx, error)
 
-	// IssueUnsignedTx signs and issues the unsigned tx.
+	// IssueUnsignedAtomicTx signs and issues the unsigned tx.
 	IssueUnsignedAtomicTx(
-		utx evm.UnsignedAtomicTx,
+		utx atomic.UnsignedAtomicTx,
 		options ...common.Option,
-	) (*evm.Tx, error)
+	) (*atomic.Tx, error)
 
 	// IssueAtomicTx issues the signed tx.
 	IssueAtomicTx(
-		tx *evm.Tx,
+		tx *atomic.Tx,
 		options ...common.Option,
 	) error
 }
@@ -71,7 +67,7 @@ type Wallet interface {
 func NewWallet(
 	builder Builder,
 	signer Signer,
-	avaxClient evm.Client,
+	avaxClient client.Client,
 	ethClient ethclient.Client,
 	backend Backend,
 ) Wallet {
@@ -88,7 +84,7 @@ type wallet struct {
 	Backend
 	builder    Builder
 	signer     Signer
-	avaxClient evm.Client
+	avaxClient client.Client
 	ethClient  ethclient.Client
 }
 
@@ -104,7 +100,7 @@ func (w *wallet) IssueImportTx(
 	chainID ids.ID,
 	to ethcommon.Address,
 	options ...common.Option,
-) (*evm.Tx, error) {
+) (*atomic.Tx, error) {
 	baseFee, err := w.baseFee(options)
 	if err != nil {
 		return nil, err
@@ -121,7 +117,7 @@ func (w *wallet) IssueExportTx(
 	chainID ids.ID,
 	outputs []*secp256k1fx.TransferOutput,
 	options ...common.Option,
-) (*evm.Tx, error) {
+) (*atomic.Tx, error) {
 	baseFee, err := w.baseFee(options)
 	if err != nil {
 		return nil, err
@@ -135,9 +131,9 @@ func (w *wallet) IssueExportTx(
 }
 
 func (w *wallet) IssueUnsignedAtomicTx(
-	utx evm.UnsignedAtomicTx,
+	utx atomic.UnsignedAtomicTx,
 	options ...common.Option,
-) (*evm.Tx, error) {
+) (*atomic.Tx, error) {
 	ops := common.NewOptions(options)
 	ctx := ops.Context()
 	tx, err := SignUnsignedAtomic(ctx, w.signer, utx)
@@ -149,7 +145,7 @@ func (w *wallet) IssueUnsignedAtomicTx(
 }
 
 func (w *wallet) IssueAtomicTx(
-	tx *evm.Tx,
+	tx *atomic.Tx,
 	options ...common.Option,
 ) error {
 	ops := common.NewOptions(options)
@@ -167,31 +163,11 @@ func (w *wallet) IssueAtomicTx(
 		return w.Backend.AcceptAtomicTx(ctx, tx)
 	}
 
-	pollFrequency := ops.PollFrequency()
-	ticker := time.NewTicker(pollFrequency)
-	defer ticker.Stop()
-
-	for {
-		status, err := w.avaxClient.GetAtomicTxStatus(ctx, txID)
-		if err != nil {
-			return err
-		}
-
-		switch status {
-		case evm.Accepted:
-			return w.Backend.AcceptAtomicTx(ctx, tx)
-		case evm.Dropped, evm.Unknown:
-			return errNotCommitted
-		}
-
-		// The tx is Processing.
-
-		select {
-		case <-ticker.C:
-		case <-ctx.Done():
-			return ctx.Err()
-		}
+	if err := awaitTxAccepted(w.avaxClient, ctx, txID, ops.PollFrequency()); err != nil {
+		return err
 	}
+
+	return w.Backend.AcceptAtomicTx(ctx, tx)
 }
 
 func (w *wallet) baseFee(options []common.Option) (*big.Int, error) {
@@ -203,4 +179,33 @@ func (w *wallet) baseFee(options []common.Option) (*big.Int, error) {
 
 	ctx := ops.Context()
 	return w.ethClient.EstimateBaseFee(ctx)
+}
+
+// TODO: Upstream this function into coreth.
+func awaitTxAccepted(
+	c client.Client,
+	ctx context.Context,
+	txID ids.ID,
+	freq time.Duration,
+	options ...rpc.Option,
+) error {
+	ticker := time.NewTicker(freq)
+	defer ticker.Stop()
+
+	for {
+		status, err := c.GetAtomicTxStatus(ctx, txID, options...)
+		if err != nil {
+			return err
+		}
+
+		if status == atomic.Accepted {
+			return nil
+		}
+
+		select {
+		case <-ticker.C:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
 }

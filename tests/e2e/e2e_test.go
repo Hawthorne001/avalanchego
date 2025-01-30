@@ -6,7 +6,7 @@ package e2e_test
 import (
 	"testing"
 
-	"github.com/onsi/gomega"
+	"github.com/onsi/ginkgo/v2"
 
 	// ensure test packages are scanned by ginkgo
 	_ "github.com/ava-labs/avalanchego/tests/e2e/banff"
@@ -16,14 +16,12 @@ import (
 	_ "github.com/ava-labs/avalanchego/tests/e2e/x"
 	_ "github.com/ava-labs/avalanchego/tests/e2e/x/transfer"
 
+	"github.com/ava-labs/avalanchego/tests/e2e/vms"
 	"github.com/ava-labs/avalanchego/tests/fixture/e2e"
 	"github.com/ava-labs/avalanchego/tests/fixture/tmpnet"
-
-	ginkgo "github.com/onsi/ginkgo/v2"
 )
 
 func TestE2E(t *testing.T) {
-	gomega.RegisterFailHandler(ginkgo.Fail)
 	ginkgo.RunSpecs(t, "e2e test suites")
 }
 
@@ -35,10 +33,21 @@ func init() {
 
 var _ = ginkgo.SynchronizedBeforeSuite(func() []byte {
 	// Run only once in the first ginkgo process
-	return e2e.NewTestEnvironment(flagVars, &tmpnet.Network{}).Marshal()
+
+	nodes := tmpnet.NewNodesOrPanic(flagVars.NodeCount())
+	subnets := vms.XSVMSubnetsOrPanic(nodes...)
+	return e2e.NewTestEnvironment(
+		e2e.NewTestContext(),
+		flagVars,
+		&tmpnet.Network{
+			Owner:   "avalanchego-e2e",
+			Nodes:   nodes,
+			Subnets: subnets,
+		},
+	).Marshal()
 }, func(envBytes []byte) {
 	// Run in every ginkgo process
 
 	// Initialize the local test environment from the global state
-	e2e.InitSharedTestEnvironment(envBytes)
+	e2e.InitSharedTestEnvironment(ginkgo.GinkgoT(), envBytes)
 })

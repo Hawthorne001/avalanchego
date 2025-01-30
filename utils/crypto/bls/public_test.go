@@ -4,6 +4,7 @@
 package bls
 
 import (
+	"encoding/base64"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -11,44 +12,41 @@ import (
 	"github.com/ava-labs/avalanchego/utils"
 )
 
-func TestPublicKeyFromBytesWrongSize(t *testing.T) {
+func TestPublicKeyFromCompressedBytesWrongSize(t *testing.T) {
 	require := require.New(t)
 
 	pkBytes := utils.RandomBytes(PublicKeyLen + 1)
-	_, err := PublicKeyFromBytes(pkBytes)
+	_, err := PublicKeyFromCompressedBytes(pkBytes)
 	require.ErrorIs(err, ErrFailedPublicKeyDecompress)
 }
 
 func TestPublicKeyBytes(t *testing.T) {
 	require := require.New(t)
 
-	sk, err := NewSecretKey()
+	pkBytes, err := base64.StdEncoding.DecodeString("h5qt9SPxaCo+vOx6sn+QkkpP7Y40Yja7SEAs2MGb/mZT7oKTWgLogjy5c4/wWIGC")
 	require.NoError(err)
 
-	pk := PublicFromSecretKey(sk)
-	pkBytes := PublicKeyToBytes(pk)
-
-	pk2, err := PublicKeyFromBytes(pkBytes)
+	pk, err := PublicKeyFromCompressedBytes(pkBytes)
 	require.NoError(err)
-	pk2Bytes := PublicKeyToBytes(pk2)
 
-	require.Equal(pk, pk2)
+	pk2Bytes := PublicKeyToCompressedBytes(pk)
+
 	require.Equal(pkBytes, pk2Bytes)
 }
 
 func TestAggregatePublicKeysNoop(t *testing.T) {
 	require := require.New(t)
 
-	sk, err := NewSecretKey()
+	pkBytes, err := base64.StdEncoding.DecodeString("h5qt9SPxaCo+vOx6sn+QkkpP7Y40Yja7SEAs2MGb/mZT7oKTWgLogjy5c4/wWIGC")
 	require.NoError(err)
 
-	pk := PublicFromSecretKey(sk)
-	pkBytes := PublicKeyToBytes(pk)
+	pk, err := PublicKeyFromCompressedBytes(pkBytes)
+	require.NoError(err)
 
 	aggPK, err := AggregatePublicKeys([]*PublicKey{pk})
 	require.NoError(err)
 
-	aggPKBytes := PublicKeyToBytes(aggPK)
+	aggPKBytes := PublicKeyToCompressedBytes(aggPK)
 	require.NoError(err)
 
 	require.Equal(pk, aggPK)

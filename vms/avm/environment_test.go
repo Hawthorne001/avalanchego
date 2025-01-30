@@ -6,65 +6,44 @@ package avm
 import (
 	"context"
 	"encoding/json"
-	"math/rand"
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/require"
 
-	"github.com/ava-labs/avalanchego/api/keystore"
 	"github.com/ava-labs/avalanchego/chains/atomic"
 	"github.com/ava-labs/avalanchego/database/memdb"
 	"github.com/ava-labs/avalanchego/database/prefixdb"
 	"github.com/ava-labs/avalanchego/ids"
 	"github.com/ava-labs/avalanchego/snow"
 	"github.com/ava-labs/avalanchego/snow/engine/common"
+	"github.com/ava-labs/avalanchego/snow/engine/enginetest"
 	"github.com/ava-labs/avalanchego/snow/snowtest"
+	"github.com/ava-labs/avalanchego/upgrade/upgradetest"
 	"github.com/ava-labs/avalanchego/utils/constants"
 	"github.com/ava-labs/avalanchego/utils/crypto/secp256k1"
 	"github.com/ava-labs/avalanchego/utils/formatting"
 	"github.com/ava-labs/avalanchego/utils/formatting/address"
-	"github.com/ava-labs/avalanchego/utils/linkedhashmap"
-	"github.com/ava-labs/avalanchego/utils/logging"
-	"github.com/ava-labs/avalanchego/utils/sampler"
 	"github.com/ava-labs/avalanchego/vms/avm/block/executor"
 	"github.com/ava-labs/avalanchego/vms/avm/config"
 	"github.com/ava-labs/avalanchego/vms/avm/fxs"
 	"github.com/ava-labs/avalanchego/vms/avm/txs"
+	"github.com/ava-labs/avalanchego/vms/avm/txs/txstest"
 	"github.com/ava-labs/avalanchego/vms/components/avax"
 	"github.com/ava-labs/avalanchego/vms/nftfx"
 	"github.com/ava-labs/avalanchego/vms/secp256k1fx"
 
 	avajson "github.com/ava-labs/avalanchego/utils/json"
-	keystoreutils "github.com/ava-labs/avalanchego/vms/components/keystore"
 )
 
 const (
 	testTxFee    uint64 = 1000
 	startBalance uint64 = 50000
 
-	username       = "bobby"
-	password       = "StrnasfqewiurPasswdn56d" //#nosec G101
 	feeAssetName   = "TEST"
 	otherAssetName = "OTHER"
 )
 
 var (
-	testChangeAddr = ids.GenerateTestShortID()
-	testCases      = []struct {
-		name      string
-		avaxAsset bool
-	}{
-		{
-			name:      "genesis asset is AVAX",
-			avaxAsset: true,
-		},
-		{
-			name:      "genesis asset is TEST",
-			avaxAsset: false,
-		},
-	}
-
 	assetID = ids.ID{1, 2, 3}
 
 	keys  = secp256k1.TestKeys()[:3] // TODO: Remove [:3]
@@ -78,15 +57,9 @@ func init() {
 	}
 }
 
-type user struct {
-	username    string
-	password    string
-	initialKeys []*secp256k1.PrivateKey
-}
-
 type envConfig struct {
+	fork             upgradetest.Fork
 	isCustomFeeAsset bool
-	keystoreUsers    []*user
 	vmStaticConfig   *config.Config
 	vmDynamicConfig  *Config
 	additionalFxs    []*common.Fx
@@ -95,13 +68,12 @@ type envConfig struct {
 }
 
 type environment struct {
-	genesisBytes  []byte
-	genesisTx     *txs.Tx
-	sharedMemory  *atomic.Memory
-	issuer        chan common.Message
-	vm            *VM
-	service       *Service
-	walletService *WalletService
+	genesisBytes []byte
+	genesisTx    *txs.Tx
+	sharedMemory *atomic.Memory
+	issuer       chan common.Message
+	vm           *VM
+	txBuilder    *txstest.Builder
 }
 
 // setup the testing environment
@@ -131,21 +103,8 @@ func setup(tb testing.TB, c *envConfig) *environment {
 	// The caller of this function is responsible for unlocking.
 	ctx.Lock.Lock()
 
-	userKeystore := keystore.New(logging.NoLog{}, memdb.New())
-	ctx.Keystore = userKeystore.NewBlockchainKeyStore(ctx.ChainID)
-
-	for _, user := range c.keystoreUsers {
-		require.NoError(userKeystore.CreateUser(user.username, user.password))
-
-		// Import the initially funded private keys
-		keystoreUser, err := keystoreutils.NewUserFromKeystore(ctx.Keystore, user.username, user.password)
-		require.NoError(err)
-
-		require.NoError(keystoreUser.PutKeys(user.initialKeys...))
-		require.NoError(keystoreUser.Close())
-	}
-
 	vmStaticConfig := config.Config{
+		Upgrades:         upgradetest.GetConfig(c.fork),
 		TxFee:            testTxFee,
 		CreateAssetTxFee: testTxFee,
 	}
@@ -186,7 +145,7 @@ func setup(tb testing.TB, c *envConfig) *environment {
 			},
 			c.additionalFxs...,
 		),
-		&common.SenderTest{},
+		&enginetest.Sender{},
 	))
 
 	stopVertexID := ids.GenerateTestID()
@@ -198,13 +157,7 @@ func setup(tb testing.TB, c *envConfig) *environment {
 		sharedMemory: m,
 		issuer:       issuer,
 		vm:           vm,
-		service: &Service{
-			vm: vm,
-		},
-		walletService: &WalletService{
-			vm:         vm,
-			pendingTxs: linkedhashmap.New[ids.ID, *txs.Tx](),
-		},
+		txBuilder:    txstest.New(vm.parser.Codec(), vm.ctx, &vm.Config, vm.feeAssetID, vm.state),
 	}
 
 	require.NoError(vm.SetState(context.Background(), snow.Bootstrapping))
@@ -218,6 +171,14 @@ func setup(tb testing.TB, c *envConfig) *environment {
 	}
 
 	require.NoError(vm.SetState(context.Background(), snow.NormalOp))
+
+	tb.Cleanup(func() {
+		env.vm.ctx.Lock.Lock()
+		defer env.vm.ctx.Lock.Unlock()
+
+		require.NoError(env.vm.Shutdown(context.Background()))
+	})
+
 	return env
 }
 
@@ -229,7 +190,6 @@ func getCreateTxFromGenesisTest(tb testing.TB, genesisBytes []byte, assetName st
 	require := require.New(tb)
 
 	parser, err := txs.NewParser(
-		time.Time{},
 		[]fxs.Fx{
 			&secp256k1fx.Fx{},
 		},
@@ -305,32 +265,6 @@ func newTx(tb testing.TB, genesisBytes []byte, chainID ids.ID, parser txs.Parser
 	}}
 	require.NoError(tx.SignSECP256K1Fx(parser.Codec(), [][]*secp256k1.PrivateKey{{keys[0]}}))
 	return tx
-}
-
-// Sample from a set of addresses and return them raw and formatted as strings.
-// The size of the sample is between 1 and len(addrs)
-// If len(addrs) == 0, returns nil
-func sampleAddrs(tb testing.TB, addressFormatter avax.AddressManager, addrs []ids.ShortID) ([]ids.ShortID, []string) {
-	require := require.New(tb)
-
-	sampledAddrs := []ids.ShortID{}
-	sampledAddrsStr := []string{}
-
-	sampler := sampler.NewUniform()
-	sampler.Initialize(uint64(len(addrs)))
-
-	numAddrs := 1 + rand.Intn(len(addrs)) // #nosec G404
-	indices, err := sampler.Sample(numAddrs)
-	require.NoError(err)
-	for _, index := range indices {
-		addr := addrs[index]
-		addrStr, err := addressFormatter.FormatLocalAddress(addr)
-		require.NoError(err)
-
-		sampledAddrs = append(sampledAddrs, addr)
-		sampledAddrsStr = append(sampledAddrsStr, addrStr)
-	}
-	return sampledAddrs, sampledAddrsStr
 }
 
 func makeDefaultGenesis(tb testing.TB) *BuildGenesisArgs {
